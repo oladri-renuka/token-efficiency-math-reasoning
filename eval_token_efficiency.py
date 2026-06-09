@@ -35,12 +35,14 @@ np.random.seed(SEED)
 class BudgetForcingProcessor(LogitsProcessor):
     def __init__(self, budget: int):
         self.budget = budget
-        self.thinking = False
+        self.thinking = True   # FIX: prompt already ends with <think>, so we start in thinking mode
         self.think_token_count = 0
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         last_token = input_ids[0, -1].item()
+
         if last_token == THINK_START_ID:
+            # Model re-entered thinking (shouldn't happen normally, but handle it)
             self.thinking = True
             self.think_token_count = 0
         elif last_token == THINK_END_ID:
@@ -51,6 +53,7 @@ class BudgetForcingProcessor(LogitsProcessor):
                 forced = torch.full_like(scores, float("-inf"))
                 forced[:, THINK_END_ID] = 0.0
                 return forced
+
         return scores
 
 
@@ -145,51 +148,45 @@ def run_inference(model, tokenizer, prompt: str, budget: int | None) -> dict:
 
 # ── B* computation ────────────────────────────────────────────────────────────
 def compute_b_star(accuracies: dict, threshold: float = 0.95) -> int | None:
-    """
-    accuracies: {budget: accuracy} where budget is int or None (uncapped)
-    Returns minimum budget where accuracy >= threshold * uncapped_accuracy,
-    and stays there for all higher budgets. None if never reached.
-    """
     uncapped_acc = accuracies.get(None)
     if uncapped_acc is None or uncapped_acc == 0:
         return None
     target = threshold * uncapped_acc
     finite_budgets = sorted([b for b in accuracies if b is not None])
-    b_star = None
     for b in finite_budgets:
         if accuracies[b] >= target:
-            # Check it stays there
             remaining = [accuracies[bb] >= target for bb in finite_budgets if bb >= b]
             if all(remaining):
-                b_star = b
-                break
-    return b_star
+                return b
+    return None
 
-def bootstrap_b_star(results: list[dict], budget_levels: list, n_resamples: int = 1000) -> dict:
-    """
-    Bootstrap CI for B*.
-    results: list of {budget: correct (bool)} per sample
-    Returns {b_star, ci_low, ci_high}
-    """
-    n = len(results)
+def bootstrap_b_star(all_per_sample: list[dict], budget_levels: list, n_resamples: int = 1000) -> dict:
+    n = len(all_per_sample)
     b_star_samples = []
 
     for _ in range(n_resamples):
         indices = np.random.randint(0, n, size=n)
-        resampled = [results[i] for i in indices]
+        resampled = [all_per_sample[i] for i in indices]
         accs = {}
         for b in budget_levels:
-            correct = [r[str(b)] for r in resampled if str(b) in r]
-            accs[b] = np.mean(correct) if correct else 0.0
+            key = "None" if b is None else str(b)
+            vals = [r[key] for r in resampled if key in r]
+            accs[b] = np.mean(vals) if vals else 0.0
         b_star_samples.append(compute_b_star(accs))
 
     valid = [b for b in b_star_samples if b is not None]
     if not valid:
         return {"b_star": None, "ci_low": None, "ci_high": None}
 
+    # Point estimate on full data
+    full_accs = {}
+    for b in budget_levels:
+        key = "None" if b is None else str(b)
+        vals = [r[key] for r in all_per_sample if key in r]
+        full_accs[b] = np.mean(vals) if vals else 0.0
+
     return {
-        "b_star": compute_b_star({b: np.mean([r[str(b)] for r in results if str(b) in r])
-                                  for b in budget_levels}),
+        "b_star": compute_b_star(full_accs),
         "ci_low": int(np.percentile(valid, 2.5)),
         "ci_high": int(np.percentile(valid, 97.5)),
     }
@@ -233,9 +230,10 @@ def eval_benchmark(model, tokenizer, name: str, samples: list[dict], budget: int
         extracted = extract_answer(result["response"])
         correct = normalize_answer(extracted) == normalize_answer(sample["answer"])
 
+        budget_key = "None" if budget is None else str(budget)
         results.append({
             "idx": i,
-            str(budget): correct,
+            budget_key: correct,
             "extracted": extracted,
             "expected": sample["answer"],
             "total_tokens": result["total_tokens"],
@@ -248,7 +246,7 @@ def eval_benchmark(model, tokenizer, name: str, samples: list[dict], budget: int
 
         if (i + 1) % 10 == 0:
             save_checkpoint(name, budget, results)
-            acc = np.mean([r[str(budget)] for r in results])
+            acc = np.mean([r[budget_key] for r in results])
             ext = np.mean([r["extraction_success"] for r in results])
             print(f"  [{i+1}/{len(samples)}] acc={acc:.3f} extraction={ext:.3f}")
 
@@ -256,7 +254,7 @@ def eval_benchmark(model, tokenizer, name: str, samples: list[dict], budget: int
     return summarize(results, budget)
 
 def summarize(results: list[dict], budget: int | None) -> dict:
-    budget_key = str(budget)
+    budget_key = "None" if budget is None else str(budget)
     correct = [r[budget_key] for r in results if budget_key in r]
     extracted = [r["extraction_success"] for r in results]
     acc_conservative = np.mean(correct) if correct else 0.0
@@ -311,52 +309,44 @@ def main():
     all_summary = {}
     for bench_name, samples in benchmarks.items():
         bench_results = []
-        per_sample_results = {str(b): [] for b in BUDGETS}
+        all_per_sample = []
 
         for budget in BUDGETS:
             summary = eval_benchmark(model, tokenizer, bench_name, samples, budget)
             bench_results.append(summary)
-            print(f"  {bench_name} | budget={budget} | "
+            budget_str = "uncapped" if budget is None else str(budget)
+            print(f"  {bench_name} | budget={budget_str} | "
                   f"acc_conservative={summary['accuracy_conservative']:.3f} | "
                   f"acc_valid={summary['accuracy_valid']:.3f} | "
-                  f"extraction={summary['extraction_rate']:.3f}")
+                  f"extraction={summary['extraction_rate']:.3f} | "
+                  f"avg_tokens={summary['avg_tokens']:.0f}")
 
-            # Validation gate
             if summary["extraction_rate"] < 0.95:
-                print(f"  !! EXTRACTION GATE FAILED for {bench_name} budget={budget} "
+                print(f"  !! EXTRACTION GATE FAILED for {bench_name} budget={budget_str} "
                       f"({summary['extraction_rate']:.3f} < 0.95)")
 
-        # Compute B*
-        accs = {}
-        for s in bench_results:
-            accs[s["budget"]] = s["accuracy_conservative"]
-
-        b_star = compute_b_star(accs)
-
-        # Bootstrap CI — load per-sample data
-        all_per_sample = []
+        # Load all per-sample data for bootstrap
         for budget in BUDGETS:
             ckpt = load_checkpoint(bench_name, budget)
             if ckpt:
+                budget_key = "None" if budget is None else str(budget)
                 for r in ckpt:
-                    # merge budget results per sample index
                     idx = r["idx"]
                     while len(all_per_sample) <= idx:
                         all_per_sample.append({})
-                    all_per_sample[idx][str(budget)] = r[str(budget)]
+                    all_per_sample[idx][budget_key] = r[budget_key]
 
         bootstrap = bootstrap_b_star(all_per_sample, BUDGETS, BOOTSTRAP_N)
 
         all_summary[bench_name] = {
             "budget_results": bench_results,
-            "b_star": b_star,
+            "b_star": bootstrap["b_star"],
             "bootstrap": bootstrap,
         }
 
-        print(f"\n  {bench_name.upper()} B* = {b_star} "
+        print(f"\n  {bench_name.upper()} B* = {bootstrap['b_star']} "
               f"[CI: {bootstrap['ci_low']} – {bootstrap['ci_high']}]")
 
-    # Save final summary
     out_path = RESULTS_DIR / ("validation_summary.json" if args.validate else "final_summary.json")
     with open(out_path, "w") as f:
         json.dump(all_summary, f, indent=2)
